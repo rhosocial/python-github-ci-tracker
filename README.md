@@ -28,13 +28,21 @@ the truth when GitHub can still answer.
 
 ## Why you would use it
 
-- **For an agent**: one call answers a whole question and names the next call. A
-  failing job tells you which step failed and whether its log is on disk — no
-  shell scrolling, no second service to stub.
-- **For a team with a matrix**: 77-job run, one `get_run`; the failing step's
-  log comes back in one call, windowed to 200 lines by default.
-- **For someone on a free-tier database**: capacity is visible (`db usage`), and
-  pruning is a partition drop rather than a `VACUUM` that locks the table.
+Three different things, and the third is the easiest to underestimate.
+
+- **Context**: a 4,000-line job log becomes `grep` and a few lines of context; a
+  12-job matrix becomes a 12-line roster. Some of that log does not fit in a
+  context window at all, so the choice is not cheaper but possible.
+- **Time**: `wait_for_run` is one bounded call instead of a polling loop;
+  `cancel_run` and `if_absent=true` stop minutes you would otherwise spend, and
+  `trigger_workflow` returns p50/p90 so you can decide what to wait for.
+- **Wrong conclusions**: `attempt`/`is_latest` separates a capacity blip from a
+  broken backend; `has_log` plus `reason` separates "no output" from "nothing was
+  captured"; `ci_status.health.alerts` reports its own silent degradation as an
+  executable list.
+
+For the long version — including an operator's measured session and what we saw
+using the service on itself — see [What it saves](docs/en_US/value.md).
 
 ## Where the details live
 

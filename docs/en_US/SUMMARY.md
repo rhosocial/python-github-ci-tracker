@@ -4,6 +4,8 @@
 
 ## Overview
 
+* [What it saves](value.md)
+
 * [Features](features.md)
 * [Architecture](architecture.md)
 

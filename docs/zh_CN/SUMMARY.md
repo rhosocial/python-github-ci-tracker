@@ -4,6 +4,8 @@
 
 ## 概览
 
+* [它省下什么](value.md)
+
 * [功能](features.md)
 * [架构](architecture.md)
 
