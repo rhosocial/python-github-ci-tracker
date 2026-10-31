@@ -55,12 +55,24 @@ def test_image_publishes_every_listener_port() -> None:
     assert {"8000", "8001", "18080"} <= ports
 
 
+def _documented_text() -> str:
+    """Every markdown file that documents the deployment.
+
+    The front README states what the project is; the deployment pages under
+    ``docs/`` carry the detail. The rule under test is "this is documented
+    somewhere", not "it is on the first page a reader opens".
+    """
+    pages = [ROOT / "README.md", ROOT / "README.zh-CN.md"]
+    pages += sorted((ROOT / "docs").rglob("*.md"))
+    return "\n".join(page.read_text(encoding="utf-8") for page in pages if page.exists())
+
+
 def test_tls_directory_is_documented_rather_than_baked_in() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    documented = _documented_text()
     assert "/certs" in dockerfile
-    assert "CITRACKER_WEBHOOK_SSL_CERTFILE" in readme
-    assert "CITRACKER_WEBHOOK_SSL_KEYFILE" in readme
+    assert "CITRACKER_WEBHOOK_SSL_CERTFILE" in documented
+    assert "CITRACKER_WEBHOOK_SSL_KEYFILE" in documented
     # Nothing may copy certificate material into the image.
     assert not re.search(r"(?im)^\s*(COPY|ADD).*certs", dockerfile)
 
