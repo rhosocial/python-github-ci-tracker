@@ -1,0 +1,321 @@
+# .github/workflows/test.yml
+#
+# Tests and static checks, in two jobs:
+#
+#   test      the unit suite: a service-container PostgreSQL (each test gets a
+#             freshly truncated schema) plus a fake GitHub client, on the one
+#             interpreter the image ships;
+#   channels  the protocol channels: the real server binary booted against a
+#             real PostgreSQL (service container) and driven over HTTP —
+#             still no network and no GitHub, the deliveries are synthetic.
+#
+# Dependency sources: the three siblings are checked out from source because the
+# versions this project needs are not on PyPI yet.
+#
+#   rhosocial-activerecord, rhosocial-activerecord-postgres  public, each pinned to
+#       its release line (v1.0.0.dev30 / v1.0.0.dev17). The column-constraint work
+#       the models depend on was merged into those lines, so the release refs are
+#       the code the image ships; the old fix/ branch is the same tree, and using
+#       it here would let this job and the Dockerfile drift apart;
+#   rhosocial-mcpserver  PUBLIC. The default GITHUB_TOKEN (contents: read) can
+#       read it cross-repository, same as the other two.
+#
+# If python-mcpserver is ever made private again, restore the checkout token and
+# the preflight secret gate, and remember why they were removed (2026-10-25):
+#   * a fine-grained PAT with Contents read-only passes the REST API but FAILS
+#     git clone/fetch with 403 "Write access to repository not granted" — git
+#     needs Contents: Read and write, so reusing a read-only PAT gets you nothing;
+#   * token-less checkout of a private repo fails with a misleading "repository
+#     not found", so preflight skipped the matrix with an explicit message.
+
+name: Test and lint
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/v**'
+  pull_request:
+    branches:
+      - main
+      - 'release/v**'
+  workflow_dispatch:
+
+concurrency:
+  # A newer push supersedes an in-flight run: the old one is testing code that no
+  # longer exists.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One interpreter, and it is the one that matters: the image ships
+        # 3.15 and local development runs 3.15, so a failure here is a failure
+        # in production. pyproject.toml still declares >=3.10 for anyone who
+        # installs the package -- that floor is a promise about installation,
+        # and testing three more interpreters to keep it honest is not a cost
+        # this service is willing to pay.
+        python-version: ['3.15']
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: citracker
+          POSTGRES_PASSWORD: citracker
+          POSTGRES_DB: citracker_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Check out the core library
+        # The release line the image installs; the column-constraint work the
+        # models depend on is merged into it.
+        uses: actions/checkout@v4
+        with:
+          repository: rhosocial/python-activerecord
+          ref: release/v1.0.0.dev30
+          path: .deps/python-activerecord
+
+      - name: Check out the Postgres backend
+        # Same release line the image installs; the two must move together.
+        uses: actions/checkout@v4
+        with:
+          repository: rhosocial/python-activerecord-postgres
+          ref: release/v1.0.0.dev17
+          path: .deps/python-activerecord-postgres
+
+      - name: Check out the MCP base layer
+        uses: actions/checkout@v4
+        with:
+          repository: rhosocial/python-mcpserver
+          path: .deps/python-mcpserver
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        # Siblings first: this project's requirements resolve against them, and
+        # installing itself first would send pip to PyPI for versions that are
+        # not published there.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .deps/python-activerecord
+          python -m pip install -e .deps/python-activerecord-postgres
+          python -m pip install -e .deps/python-mcpserver
+          python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Check formatting
+        run: black --check src tests
+
+      - name: Check import order
+        run: isort --check-only src tests
+
+      - name: Test
+        # The suite binds the models to the service-container PostgreSQL below
+        # and rebuilds its schema between tests, so the interpreter is the only
+        # variable. No network and no GitHub: the client is faked.
+        run: pytest tests -q
+        env:
+          # "No server" must fail here rather than skip: a wall of skips would
+          # mean the job stopped covering anything and still reports green.
+          CITRACKER_TEST_PG_REQUIRED: '1'
+          CITRACKER_DB_HOST: localhost
+          CITRACKER_DB_PORT: '5432'
+          CITRACKER_DB_USER: citracker
+          CITRACKER_DB_PASSWORD: citracker
+          CITRACKER_DB_SSLMODE: prefer
+
+  channels:
+    name: Protocol channels (real server, PostgreSQL)
+    # The unit suite exercises the FastAPI app in-process against PostgreSQL.
+    # job boots the real server binary against a real PostgreSQL and speaks
+    # HTTP to it, which is what covers the lifespan pool, the per-request
+    # binding middleware and the webhook receiver as an endpoint — the seams
+    # that only a live server can prove. Gated tests live in tests/integration
+    # and are skipped everywhere else.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: citracker
+          POSTGRES_PASSWORD: citracker
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Check out the core library
+        # The release line the image installs; the column-constraint work the
+        # models depend on is merged into it.
+        uses: actions/checkout@v4
+        with:
+          repository: rhosocial/python-activerecord
+          ref: release/v1.0.0.dev30
+          path: .deps/python-activerecord
+
+      - name: Check out the Postgres backend
+        # Same release line the image installs; the two must move together.
+        uses: actions/checkout@v4
+        with:
+          repository: rhosocial/python-activerecord-postgres
+          ref: release/v1.0.0.dev17
+          path: .deps/python-activerecord-postgres
+
+      - name: Check out the MCP base layer
+        uses: actions/checkout@v4
+        with:
+          repository: rhosocial/python-mcpserver
+          path: .deps/python-mcpserver
+
+      - name: Set up Python 3.15
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.15'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        # Siblings first: this project's requirements resolve against them, and
+        # installing itself first would send pip to PyPI for versions that are
+        # not published there.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .deps/python-activerecord
+          python -m pip install -e .deps/python-activerecord-postgres
+          python -m pip install -e .deps/python-mcpserver
+          python -m pip install -e ".[dev]"
+
+      - name: Initialize the database schema
+        # No migrations: the DDL is the single source of truth, so the schema
+        # is created, not migrated.
+        run: python -m rhosocial.github_ci_tracker.adapters.cli.db init
+        env:
+          CITRACKER_DB_HOST: localhost
+          CITRACKER_DB_PORT: '5432'
+          CITRACKER_DB_USER: citracker
+          CITRACKER_DB_PASSWORD: citracker
+          CITRACKER_DB_NAME: test_db
+
+      - name: Run the channel tests
+        run: pytest tests/integration -q
+        env:
+          CITRACKER_E2E_POSTGRES: '1'
+          CITRACKER_E2E_DB_HOST: localhost
+          CITRACKER_E2E_DB_PORT: '5432'
+          CITRACKER_E2E_DB_USER: citracker
+          CITRACKER_E2E_DB_PASSWORD: citracker
+          CITRACKER_E2E_DB_NAME: test_db
+
+  models:
+    name: models stand alone (PostgreSQL 18)
+    # The layer's independence is a test, not a claim: this job gives it a real
+    # server and nothing else -- no service layer, no GitHub client, no
+    # credential provider. tests/models/test_standalone.py builds a private
+    # schema inside that server and drops it again.
+    #
+    # The address arrives through the same CITRACKER_DB_* variables the
+    # application reads, so this job configures the database exactly once. No
+    # scenarios file is involved: that is a local convenience, and depending on
+    # one would make the check mean "runs on the author's machine".
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: citracker
+          POSTGRES_PASSWORD: citracker
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        # GitHub waits for this before the first step, which is the
+        # "started successfully, then test" ordering the check relies on.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Check out the core library
+        uses: actions/checkout@v4
+        with:
+          repository: rhosocial/python-activerecord
+          ref: release/v1.0.0.dev30
+          path: .deps/python-activerecord
+
+      - name: Check out the Postgres backend
+        uses: actions/checkout@v4
+        with:
+          repository: rhosocial/python-activerecord-postgres
+          ref: release/v1.0.0.dev17
+          path: .deps/python-activerecord-postgres
+
+      - name: Check out the MCP base layer
+        uses: actions/checkout@v4
+        with:
+          repository: rhosocial/python-mcpserver
+          path: .deps/python-mcpserver
+
+      - name: Set up Python 3.15
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.15'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .deps/python-activerecord
+          python -m pip install -e .deps/python-activerecord-postgres
+          python -m pip install -e .deps/python-mcpserver
+          python -m pip install -e ".[dev]"
+
+      - name: Run the standalone model tests
+        # CITRACKER_TEST_PG_REQUIRED turns "no server" into a failure: a skip
+        # here would mean the check quietly stopped covering anything.
+        run: |
+          pytest tests/models/test_standalone.py tests/controllers/test_run_controller_postgres.py -q -rs
+        env:
+          CITRACKER_TEST_PG_REQUIRED: '1'
+          CITRACKER_DB_HOST: localhost
+          CITRACKER_DB_PORT: '5432'
+          CITRACKER_DB_USER: citracker
+          CITRACKER_DB_PASSWORD: citracker
+          CITRACKER_DB_SSLMODE: prefer

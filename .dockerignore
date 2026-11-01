@@ -1,0 +1,25 @@
+# Keep the build context to the package itself. The entrypoint lives in
+# docker/ and must stay in the context; the secrets that sit beside it must
+# not.
+.git
+.gitignore
+.github
+.claude
+.venv*
+.deps
+.docker
+tests
+scripts
+*.md
+!README.md
+.env*
+*.log
+__pycache__
+*.pyc
+.pytest_cache
+.benchmarks
+build
+dist
+docker/certs
+docker/stack.env
+docker/README.md

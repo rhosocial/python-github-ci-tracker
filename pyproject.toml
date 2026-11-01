@@ -1,0 +1,131 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rhosocial-github-ci-tracker"
+version = "1.0.0.dev1"
+description = "GitHub CI status tracking and automation service"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Rho Social" },
+]
+keywords = ["github", "ci", "cd", "automation", "tracking"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
+
+dependencies = [
+    "rhosocial-activerecord",
+    # The MCP adapter is verified against the 1.0 line; install the sibling
+    # from git/local until that release is on PyPI.
+    "rhosocial-mcpserver>=1.0.0.dev1",
+    "httpx2>=2.10.0",
+    # rhosocial.mcpserver imports the real `httpx` at module level (mcp ships
+    # httpx2 instead), so the MCP adapter cannot import without it. Declared
+    # here until the sibling project adds it to its own dependencies.
+    "httpx>=0.27",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.31.1",
+]
+
+[project.scripts]
+rhosocial-github-ci-tracker = "rhosocial.github_ci_tracker.adapters.cli.main:main"
+rhosocial-github-ci-tracker-db = "rhosocial.github_ci_tracker.adapters.cli.db:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-mock",
+    # tests/models/test_standalone.py reads a scenarios file when one is named;
+    # CI passes connection variables instead, but the import is unconditional.
+    "pyyaml",
+    "ruff",
+    "black",
+    "isort",
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/rhosocial/python-github-ci-tracker"
+Repository = "https://github.com/rhosocial/python-github-ci-tracker"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+# rhosocial/ is a PEP 420 namespace so this can coexist with
+# rhosocial.activerecord and rhosocial.mcpserver in one environment.
+namespaces = true
+
+[tool.ruff]
+line-length = 100
+# The floor, not the runtime: the image and CI are 3.15, installers may be 3.10.
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "A", "C4", "T20"]
+# B008: `Depends(...)` / `Query(...)` in FastAPI signatures is the documented
+#       pattern, not a bug.
+# A002: API and MCP tools take `id`, `type`, `format` because those are the
+#       names callers use; renaming them would leak a style rule into the API.
+ignore = ["B008", "A002"]
+
+[tool.ruff.lint.per-file-ignores]
+# The CLI's stdout is its product, not debug output.
+"src/**/adapters/cli/**" = ["T201"]
+"src/**/cli/**" = ["T201"]
+# Module-level debug entry points print by design.
+"src/**/__main__.py" = ["T201"]
+"src/**/core/__main__.py" = ["T201"]
+"src/**/github/__main__.py" = ["T201"]
+# ORM models legitimately declare `id` / `name` columns.
+"src/**/models/**" = ["A001", "A003"]
+# Diagnostic scripts print by design.
+"scripts/**" = ["T201", "E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+
+[tool.pytest.ini_options]
+# ``.`` puts ``tests/`` on sys.path, which is how the reference suites import their
+# scenario and provider modules by plain name (``from providers.scenarios import
+# ...``) without making the test tree a package. Without it, a test directory is
+# the only thing on sys.path and any helper next to conftest is unreachable.
+pythonpath = ["."]
+
+# The reference suites (python-activerecord and its backends) run in auto mode,
+# which is what lets a test be a plain ``async def`` and an async fixture a plain
+# ``@pytest.fixture``. Without it every async test needs an explicit mark, and the
+# workaround is a decorator that wraps ``asyncio.run`` -- which is what this file
+# used to carry around, and why setup and teardown could not be a fixture.
+asyncio_mode = "auto"

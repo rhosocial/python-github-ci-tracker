@@ -1,0 +1,56 @@
+# One-piece deployment: CITracker plus its own PostgreSQL 18.
+#
+# Use this overlay together with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.bundled.yml \
+#     --env-file docker/stack.env up -d
+#
+# The overlay only adds the official postgres:18 image and points every app
+# container at it. It overrides CITRACKER_DB_HOST on purpose, so an external
+# database named in stack.env cannot leak into this shape.
+#
+# Data lives in the named volume `pgdata`. `docker compose ... down` keeps it;
+# `down -v` deletes it.
+
+services:
+  init:
+    environment:
+      CITRACKER_DB_HOST: postgres
+      CITRACKER_DB_PORT: "5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    environment:
+      CITRACKER_DB_HOST: postgres
+      CITRACKER_DB_PORT: "5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mcp:
+    environment:
+      CITRACKER_DB_HOST: postgres
+      CITRACKER_DB_PORT: "5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${CITRACKER_DB_USER:-citracker}
+      POSTGRES_PASSWORD: ${CITRACKER_DB_PASSWORD:-citracker}
+      POSTGRES_DB: ${CITRACKER_DB_NAME:-citracker}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  pgdata:

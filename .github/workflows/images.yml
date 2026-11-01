@@ -1,0 +1,198 @@
+# .github/workflows/images.yml
+#
+# Publishes the service image to the Aliyun registry, so deployments inside
+# mainland China pull from a domestic registry instead of docker.io.
+#
+# Two tags per build, with different jobs:
+#   citracker:sha-<sha>  the commit that was built. Written by every build, never
+#                        overwritten by another commit, safe to pin in a deploy.
+#   citracker:latest     what main builds from. Moved only after the build
+#                        finishes, and only when main has not moved past the
+#                        built commit -- a build of an older commit that happens
+#                        to finish last must not replace a newer image.
+#
+# The build uses the upstream python:3.15-slim base and the standard PyPI: a
+# GitHub runner reaches both directly, so no mirror and no proxy are involved.
+#
+# Needs two repository secrets (Settings -> Secrets and variables -> Actions):
+#   ALIYUN_REGISTRY_USERNAME / ALIYUN_REGISTRY_PASSWORD
+# Without them the job still builds (a build failure is a real failure) but
+# publishes nothing and says so in the run summary.
+
+name: Publish images
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Dockerfile
+      - docker-bake.hcl
+      - 'docker/**'
+      - '.github/workflows/images.yml'
+      # The image installs this project from its own source, so a service change
+      # is an image change. Without these two the published `latest` silently
+      # lagged behind `main` until the next Dockerfile edit.
+      - 'src/**'
+      - pyproject.toml
+  workflow_dispatch:
+
+concurrency:
+  # Per-commit, not per-branch: a newer commit supersedes its own in-flight
+  # build (the old one would publish code that no longer exists), but a
+  # workflow_dispatch must not be cancelled by an unrelated push on the same
+  # branch -- that publish is the only path to the registry once CI is done.
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: registry.cn-shanghai.aliyuncs.com
+  NAMESPACE: vistart_public
+  IMAGE: citracker
+
+jobs:
+  citracker:
+    name: Service image
+    runs-on: ubuntu-latest
+
+    steps:
+      # The siblings come from git inside the Dockerfile, so only this
+      # repository needs checking out.
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      # The image is published worldwide; a proxy is a mainland-China runtime
+      # choice. Keep it out of the build inputs rather than discovering it in a
+      # published layer.
+      #
+      # grep, not rg: the runner image has no ripgrep, and a missing command
+      # inside `if` reads as "no match" -- the guard ran and checked nothing on
+      # every build until this was noticed in a log (2026-10-31).
+      - name: Guard against proxy configuration in the image
+        run: |
+          if grep -nEi -- 'https?_proxy|all_proxy|no_proxy|pip_index_url|pip_trusted_host|mirrors\.aliyun\.com|127\.0\.0\.1:7897' \
+            Dockerfile docker/entrypoint.sh .dockerignore docker-compose.yml docker-compose.bundled.yml; then
+            echo "::error::proxy or mirror configuration must stay runtime-only"
+            exit 1
+          fi
+          echo "no proxy or mirror configuration in the image inputs"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The commit and the CI run number are what make "which build is this?"
+      # answerable from inside the container; the timestamp is stamped here
+      # rather than inside the Dockerfile so it is the moment of publication.
+      - name: Stamp this build
+        id: stamp
+        run: echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Check registry credentials
+        id: check
+        env:
+          USERNAME: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          PASSWORD: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+        run: |
+          if [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Missing secrets: ALIYUN_REGISTRY_USERNAME / ALIYUN_REGISTRY_PASSWORD"
+              echo
+              echo "The image builds but is not pushed. Add both secrets to publish."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::registry credentials absent; building without publishing"
+          fi
+
+      - name: Log in to the registry
+        if: steps.check.outputs.present == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      # Every build publishes its own commit tag and nothing else. `latest` is
+      # moved afterwards by the next step, because which build finishes last is
+      # not which commit is newest: two pushes close together build in parallel
+      # under different concurrency groups, and on 2026-10-31 the older commit
+      # finished second and silently replaced the newer image under `latest`.
+      - name: Build and publish the service image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.check.outputs.present == 'true' }}
+          # The Aliyun registry rejects OCI attestation manifests
+          # (application/vnd.oci.empty.v1+json) with "unknown manifest class",
+          # so provenance stays off for this target.
+          provenance: false
+          # The service reports these back from /readyz, /livez and ci_status.
+          build-args: |
+            GIT_REVISION=${{ github.sha }}
+            GIT_BUILD_NUMBER=${{ github.run_number }}
+            GIT_BUILT_AT=${{ steps.stamp.outputs.built_at }}
+          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE }}:sha-${{ github.sha }}
+
+      # `latest` means "the tip of main's image", and only a build that can still
+      # claim that may move it. A newer commit either already moved it (in which
+      # case this step leaves it alone) or will move it when it finishes (this
+      # step ran first, so `latest` is stale only for a moment). Either order
+      # ends on the newest commit, which is the property a plain `latest` tag in
+      # the build step cannot have.
+      #
+      # "A newer commit" is not enough to rule this build out: the push trigger
+      # filters on the paths the image is built from, so a docs-only commit on
+      # main starts no build. When main moved but nothing the image is made of
+      # changed, this image is exactly what the tip would produce, and holding
+      # `latest` back would leave it older than main forever.
+      #
+      # A manual dispatch on main is an explicit republish -- rolling back to an
+      # older commit is a legitimate reason to run one -- so it is honoured as
+      # is. A dispatch on any other ref publishes its commit tag only: feature
+      # code must not become what production pulls.
+      - name: Point latest at this commit if main has not moved past it
+        if: steps.check.outputs.present == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          tag="$REGISTRY/$NAMESPACE/$IMAGE"
+
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "::notice::$REF is not main; published $tag:sha-$GITHUB_SHA, latest untouched" |
+              tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "::notice::manual republish of main; moving latest to $GITHUB_SHA"
+          else
+            git fetch --no-tags --depth=1 origin main >/dev/null
+            tip=$(git rev-parse FETCH_HEAD)
+            if [ "$tip" != "$GITHUB_SHA" ]; then
+              # Keep this list identical to the `paths:` filter that decides
+              # which pushes build an image at all.
+              changed=$(git diff --name-only "$GITHUB_SHA" "$tip" -- \
+                Dockerfile docker-bake.hcl docker/ src/ pyproject.toml \
+                .github/workflows/images.yml)
+              if [ -n "$changed" ]; then
+                echo "::notice::main moved on to $tip with image inputs changed; published $tag:sha-$GITHUB_SHA, latest untouched" |
+                  tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "::notice::main moved on to $tip without changing an image input; latest follows this build"
+            fi
+          fi
+
+          docker buildx imagetools create --tag "$tag:latest" "$tag:sha-$GITHUB_SHA"
+          echo "latest -> $GITHUB_SHA" | tee -a "$GITHUB_STEP_SUMMARY"

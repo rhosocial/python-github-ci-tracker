@@ -1,0 +1,167 @@
+# CITracker: the service image, split into the two roles it serves.
+#
+#   web   REST (8000, internal) + GitHub webhook receiver (18080, published)
+#   mcp   MCP over Streamable HTTP (8001, published)
+#   init  one-shot first-boot runner for ./docker/init.d; web and mcp wait for it
+#
+# No database, no certificates and no operational init scripts live in the
+# image. Pair this file with an external PostgreSQL, or add
+# docker-compose.bundled.yml to run postgres:18 beside it. TLS material is
+# mounted from ./docker/certs, never baked in.
+#
+# The first boot creates the schema and, when a PAT is configured, registers the
+# credential. The scripts come from ./docker/init.d (read-only mount): the image
+# only knows how to run them, like the official database images. Once the schema
+# exists they are skipped; CITRACKER_INITDB=force re-runs them, =skip disables
+# them. See docker/README.md.
+#
+# First run (external database):
+#   cp docker/stack.env.example docker/stack.env   # fill in secrets and DB
+#   cp <fullchain.pem> <privkey.pem> docker/certs/
+#   docker compose --env-file docker/stack.env up -d
+#
+# One-piece (postgres:18 beside the app):
+#   docker compose -f docker-compose.yml -f docker-compose.bundled.yml \
+#     --env-file docker/stack.env up -d
+#
+# Logs: `docker compose logs -f web mcp` (stdout by design).
+
+name: citracker
+
+x-app: &app
+  # Pull the published image by default. Set CITRACKER_IMAGE=citracker:local
+  # (and add --build) to run a local build instead.
+  image: ${CITRACKER_IMAGE:-registry.cn-shanghai.aliyuncs.com/vistart_public/citracker:latest}
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment: &app-env
+    CITRACKER_DB_HOST: ${CITRACKER_DB_HOST:-postgres}
+    CITRACKER_DB_PORT: ${CITRACKER_DB_PORT:-5432}
+    CITRACKER_DB_USER: ${CITRACKER_DB_USER:-citracker}
+    CITRACKER_DB_PASSWORD: ${CITRACKER_DB_PASSWORD:-citracker}
+    CITRACKER_DB_NAME: ${CITRACKER_DB_NAME:-citracker}
+    CITRACKER_DB_SSLMODE: ${CITRACKER_DB_SSLMODE:-prefer}
+    CITRACKER_API_KEY: ${CITRACKER_API_KEY:-}
+    CITRACKER_PUBLIC_BASE_URL: ${CITRACKER_PUBLIC_BASE_URL:-}
+    CITRACKER_WEBHOOK_URL: ${CITRACKER_WEBHOOK_URL:-}
+    CITRACKER_LOG_LEVEL: ${CITRACKER_LOG_LEVEL:-INFO}
+    # Alias of the PAT the whole process uses. The credential is resolved once
+    # at startup and handed to every controller, so a rotation needs a restart.
+    # Sourced from the bootstrap name so init.d and the runtime cannot end up
+    # naming different rows; leave it pointing at a name that was never
+    # registered and the controllers fall back to per-repository bindings.
+    CITRACKER_PAT_NAME: ${CITRACKER_BOOTSTRAP_PAT_NAME:-default}
+    # 1 disables the init.d runner on every container. Set it for a
+    # pre-provisioned ("legacy") deployment that manages schema and credentials
+    # itself. Per-service, CITRACKER_INITDB=skip is the equivalent.
+    CITRACKER_LEGACY: ${CITRACKER_LEGACY:-0}
+
+services:
+  # One-shot first-boot runner. The entrypoint checks whether the schema
+  # exists and, when it does not, runs every *.sh in /docker-entrypoint-init.d
+  # in order before exiting. web and mcp start only after this succeeds.
+  #
+  # The scripts are deployment data, mounted from ./docker/init.d; the image
+  # contains no schema or credential logic. Edit or add scripts there, then run
+  # `docker compose run --rm -e CITRACKER_INITDB=force init` to re-apply.
+  init:
+    <<: *app
+    restart: "no"
+    command: ["true"]
+    environment:
+      <<: *app-env
+      CITRACKER_INITDB: ${CITRACKER_INITDB:-auto}
+      # Read by 20-pat.sh, not by the entrypoint. Leave both empty to skip
+      # credential provisioning while still creating the schema.
+      CITRACKER_BOOTSTRAP_PAT: ${CITRACKER_BOOTSTRAP_PAT:-}
+      CITRACKER_BOOTSTRAP_PAT_FILE: ${CITRACKER_BOOTSTRAP_PAT_FILE:-}
+      CITRACKER_BOOTSTRAP_PAT_NAME: ${CITRACKER_BOOTSTRAP_PAT_NAME:-default}
+      CITRACKER_BOOTSTRAP_PROBE_REPO: ${CITRACKER_BOOTSTRAP_PROBE_REPO:-}
+    volumes:
+      - ./docker/init.d:/docker-entrypoint-init.d:ro
+
+  web:
+    <<: *app
+    command: ["rhosocial-github-ci-tracker", "serve", "all"]
+    environment:
+      <<: *app-env
+      # init already ran the scripts; doing it again would race the schema on
+      # a first boot and rotate the same credential from two containers.
+      CITRACKER_INITDB: "skip"
+      CITRACKER_REST_HOST: 0.0.0.0
+      CITRACKER_REST_PORT: "8000"
+      CITRACKER_WEBHOOK_HOST: 0.0.0.0
+      CITRACKER_WEBHOOK_PORT: "18080"
+      # The HMAC secret of the GitHub webhooks. It belongs in docker/stack.env,
+      # which is git-ignored, so it never reaches the image or the repository.
+      CITRACKER_WEBHOOK_SECRET: ${CITRACKER_WEBHOOK_SECRET:-}
+      # TLS material mounted from the host; nothing here enters the image.
+      # Set either variable to an empty string to serve plain HTTP (for a
+      # deployment that terminates TLS in a reverse proxy).
+      CITRACKER_WEBHOOK_SSL_CERTFILE: ${CITRACKER_WEBHOOK_SSL_CERTFILE-/certs/fullchain.pem}
+      CITRACKER_WEBHOOK_SSL_KEYFILE: ${CITRACKER_WEBHOOK_SSL_KEYFILE-/certs/privkey.pem}
+    ports:
+      # The fixed port. GitHub reaches the webhook receiver here over https.
+      # Overridable for local testing beside a running instance.
+      - "${CITRACKER_WEBHOOK_PORT_HOST:-18080}:18080"
+    volumes:
+      - ./docker/certs:/certs:ro
+    healthcheck:
+      # "Up" only says the process exists. /readyz is the readiness probe: it
+      # asks the database for one round trip, which is the part that actually
+      # breaks -- a stale database address leaves the container running and
+      # every request answering 500. /livez (no I/O) is what a restart policy
+      # should watch; probing it here would restart a healthy process whose
+      # database is merely unreachable.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import ssl, urllib.request
+          try:
+              urllib.request.urlopen(
+                  "https://127.0.0.1:18080/readyz",
+                  context=ssl._create_unverified_context(),
+                  timeout=5,
+              )
+          except Exception:
+              urllib.request.urlopen("http://127.0.0.1:18080/readyz", timeout=5)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  mcp:
+    <<: *app
+    command: ["rhosocial-github-ci-tracker", "serve", "mcp"]
+    environment:
+      <<: *app-env
+      CITRACKER_INITDB: "skip"
+      CITRACKER_MCP_HOST: 0.0.0.0
+      CITRACKER_MCP_PORT: "8001"
+    ports:
+      - "${CITRACKER_MCP_PORT_HOST:-8001}:8001"
+    healthcheck:
+      # Same reason as web: the process being alive is not the same as the
+      # service being able to answer. /readyz reads the database; the MCP
+      # listener answers it before the SDK sees the request.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request
+          urllib.request.urlopen("http://127.0.0.1:8001/readyz", timeout=5)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      init:
+        condition: service_completed_successfully

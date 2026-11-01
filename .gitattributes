@@ -1,0 +1,10 @@
+# Normalize line endings: the repository stores LF, matching the project rule
+# "行结束符: 使用 LF（Unix 风格）". Without this, Windows checkouts flip every
+# file to CRLF and the next commit rewrites the whole tree.
+* text=auto eol=lf
+
+# Binary and generated files that must never be touched
+*.png binary
+*.jpg binary
+*.ico binary
+*.whl binary
