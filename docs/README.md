@@ -21,3 +21,5 @@ Please select your language / 请选择语言：
   caller-supplied pattern.
 - **PostgreSQL only**: monthly partitions on the log tables, so dropped data is
   one `DROP TABLE` instead of a locking vacuum.
+
+[What it saves](en_US/value.md) — context, wall time, and wrong conclusions.

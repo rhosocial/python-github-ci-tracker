@@ -4,6 +4,8 @@
 
 * [Overview](README.md)
 * [Features](features.md)
+* [What it saves](value.md)
+* [Architecture](architecture.md)
 
 ## Running it
 
@@ -22,7 +24,6 @@
 
 * [Development](development.md)
 * [Testing](testing.md)
-* [Architecture](architecture.md)
 
 ---
 

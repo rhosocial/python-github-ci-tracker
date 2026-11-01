@@ -4,6 +4,8 @@
 
 * [概览](README.md)
 * [功能](features.md)
+* [它省下什么](value.md)
+* [架构](architecture.md)
 
 ## 运行
 
@@ -22,7 +24,6 @@
 
 * [开发](development.md)
 * [测试](testing.md)
-* [架构](architecture.md)
 
 ---
 
